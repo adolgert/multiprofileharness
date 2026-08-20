@@ -17,6 +17,7 @@ from . import keys, run
 from .types import ConfigError, config_home, state_home
 
 DASH = "—"
+TOPOLOGIES = ("container", "process", "none")
 COLUMNS = ("backend", "credential", "status", "model", "ctx", "tools", "price", "note")
 BLANK = (DASH,) * 4  # model, ctx, tools, price: nothing to say about any of them
 
@@ -200,6 +201,30 @@ def resolve_config(explicit: Path | None) -> Path:
     raise ConfigError("no config directory found; tried: " + ", ".join(tried))
 
 
+def _settle_topology(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject options that mean nothing under the chosen topology, then default.
+
+    argparse checks `choices` only for a value it parsed, so a typo in
+    $MA_TOPOLOGY would otherwise sail through as the default.
+    """
+    if args.topology not in TOPOLOGIES:
+        parser.error(
+            f"unknown topology {args.topology!r} from $MA_TOPOLOGY; "
+            f"choose from {', '.join(TOPOLOGIES)}"
+        )
+    if args.topology != "container":
+        for flag, value in (("--engine", args.engine), ("--image", args.image)):
+            if value is not None:
+                parser.error(
+                    f"{flag} applies only to --topology container, "
+                    f"and this run is --topology {args.topology}"
+                )
+    if args.topology == "none" and args.ca_bundle:
+        parser.error("--ca-bundle configures a proxy, and --topology none starts none")
+    args.engine = args.engine or os.environ.get("MA_CONTAINER_ENGINE", "docker")
+    args.image = args.image or "multiagent"
+
+
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", type=Path, default=None, help="shared config dir")
     parser.add_argument("--machine", type=Path, default=config_home() / "machine.yaml")
@@ -227,23 +252,31 @@ def main(argv=None) -> int:
     runner = sub.add_parser(
         "run",
         help="start an agent against a project's models",
-        description="Start the proxy and the agent in a container. "
+        description="Start the proxy and the agent, in a container by default. "
         "Put the agent's command after `--`.",
     )
     # Required: a run without a policy is a run that can spend any credential
     # this machine holds.
     runner.add_argument("--project", required=True, help="project policy to apply")
     _common(runner)
-    runner.add_argument("--image", default="multiagent", help="agent container image")
+    runner.add_argument(
+        "--topology",
+        choices=TOPOLOGIES,
+        default=os.environ.get("MA_TOPOLOGY", "container"),
+        help="where the proxy runs: container (default, or $MA_TOPOLOGY), "
+        "process (host process, weaker isolation), none (no proxy at all)",
+    )
+    # Defaulted after the fact, so that giving either one under a topology that
+    # has no container to give it to is an error rather than a silent no-op.
+    runner.add_argument("--image", help="agent container image (default: multiagent)")
     runner.add_argument(
         "--engine",
-        default=os.environ.get("MA_CONTAINER_ENGINE", "docker"),
         help="container engine (default: $MA_CONTAINER_ENGINE or docker)",
     )
     runner.add_argument(
         "--ca-bundle",
         type=Path,
-        help="corporate CA to trust inside the container, instead of disabling TLS checks",
+        help="corporate CA to trust in the proxy, instead of disabling TLS checks",
     )
     runner.add_argument(
         "--dry-run",
@@ -265,6 +298,8 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
     args.agent = agent or ["bash"]
+    if hasattr(args, "topology"):
+        _settle_topology(parser, args)
     if hasattr(args, "config"):
         try:
             args.config = resolve_config(args.config)

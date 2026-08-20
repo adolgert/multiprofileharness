@@ -1,7 +1,9 @@
 """What `ma run` hands the container, and what it must never hand it.
 
 render.py is stubbed here on purpose: these tests are about the launch — the
-env file, the argv, the mounts — not about proxy config content.
+env file, the argv, the mounts — not about proxy config content. The
+containerless topologies are launches too, so they are tested from the same
+fixture: nothing here starts a real docker, a real litellm, or a real socket.
 """
 import json
 import shlex
@@ -9,8 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from multiagent import run
+from multiagent import run, topology
 from multiagent.types import Backend, ObservedModel, ProbeResult
+
+PORT = 45678
 
 BACKENDS = """
 backends:
@@ -92,10 +96,18 @@ def launch(monkeypatch, tmp_path, config_dir):
         seen["backends"] = backends
         seen["merged"] = merged
         seen["key_env"] = key_env
-        return {"model_list": []}
+        return {
+            "model_list": [],
+            "litellm_settings": {"callbacks": "custom_callbacks.proxy_handler_instance"},
+        }
 
     monkeypatch.setattr(run, "render_config", fake_render)
-    monkeypatch.setattr(run, "to_yaml", lambda config: RENDERED)
+
+    def fake_yaml(config):
+        seen["config"] = config
+        return RENDERED
+
+    monkeypatch.setattr(run, "to_yaml", fake_yaml)
 
     class Launch:
         code = None
@@ -106,22 +118,41 @@ def launch(monkeypatch, tmp_path, config_dir):
         called = False
         leaks = None
         rendered = seen
+        agent_env = None
+        proxy = None
+        proxy_argv = None
+        proxy_env = None
 
-    def fake_docker(argv, *args, **kwargs):
+    def fake_run(argv, *args, **kwargs):
+        """Stands in for both `docker run` and a containerless agent process."""
         Launch.called = True
         Launch.argv = list(argv)
-        env_path = _env_path(argv)
-        Launch.env_text = env_path.read_text()
-        Launch.env_mode = env_path.stat().st_mode & 0o777
-        Launch.config_text = (env_path.parent / "config.yaml").read_text()
-        # Evaluated now: the launch directory is gone by the time a test looks.
-        Launch.leaks = [
-            mount for mount in _flag(argv, "-v")
-            if _reaches(Path(mount.split(":")[0]), env_path)
-        ]
+        Launch.agent_env = kwargs.get("env")
+        if "--env-file" in argv:
+            env_path = _env_path(argv)
+            Launch.env_text = env_path.read_text()
+            Launch.env_mode = env_path.stat().st_mode & 0o777
+            Launch.config_text = (env_path.parent / "config.yaml").read_text()
+            # Evaluated now: the launch directory is gone by the time a test looks.
+            Launch.leaks = [
+                mount for mount in _flag(argv, "-v")
+                if _reaches(Path(mount.split(":")[0]), env_path)
+            ]
         return _Completed(7)
 
-    monkeypatch.setattr(run.subprocess, "run", fake_docker)
+    monkeypatch.setattr(run.subprocess, "run", fake_run)
+
+    def fake_popen(argv, *args, **kwargs):
+        Launch.proxy_argv = list(argv)
+        Launch.proxy_env = kwargs.get("env")
+        Launch.config_text = Path(argv[argv.index("--config") + 1]).read_text()
+        Launch.proxy = _Proxy()
+        return Launch.proxy
+
+    monkeypatch.setattr(topology.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(topology, "free_port", lambda: PORT)
+    monkeypatch.setattr(topology, "_healthy", lambda url: True)
+    monkeypatch.setattr(topology.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     cred_dir = tmp_path / "creds"
     cred_dir.mkdir()
@@ -149,6 +180,28 @@ def launch(monkeypatch, tmp_path, config_dir):
 class _Completed:
     def __init__(self, returncode):
         self.returncode = returncode
+
+
+class _Proxy:
+    """A litellm that starts, stays up, and stops when asked."""
+
+    returncode = None
+    terminated = False
+    killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 def _env_path(argv):
@@ -432,3 +485,237 @@ def test_project_without_credentials_still_launches(launch):
     assert len(result.env_text.splitlines()) == 1
     assert "MA_SCRUB=" in result.argv
     assert result.rendered["key_env"] == {}
+
+
+# --- --topology process: the proxy as a host process ----------------------
+
+
+def test_process_proxy_holds_the_secrets_the_agent_never_sees(launch):
+    result = launch("--topology", "process")
+    assert result.code == 7
+    assert result.proxy_env[NAMESPACED_KEY] == SECRET
+    assert result.proxy_env["MA_CLOUD_GEMINI_PROJECT"] == "demo"
+    assert len(result.proxy_env["LITELLM_MASTER_KEY"]) >= 32
+
+    agent = result.agent_env
+    assert NAMESPACED_KEY not in agent
+    assert "GEMINI_API_KEY" not in agent
+    assert SECRET not in agent.values()
+    assert "MA_SCRUB" not in agent  # nothing to scrub: the secrets never arrive
+    base = f"http://127.0.0.1:{PORT}/v1"
+    assert agent["OPENAI_BASE_URL"] == base
+    assert agent["OPENAI_API_BASE"] == base
+    assert agent["OPENAI_API_KEY"] == result.proxy_env["LITELLM_MASTER_KEY"]
+    assert agent["MA_PROJECT"] == "all-in"
+
+
+def test_process_leaves_the_launchers_own_environment_alone(launch):
+    import os
+
+    launch("--topology", "process")
+    assert NAMESPACED_KEY not in os.environ
+    assert "LITELLM_MASTER_KEY" not in os.environ
+
+
+def test_process_agent_does_not_inherit_provider_vars_the_launcher_exported(
+    launch, monkeypatch
+):
+    # A sourced .env in the launching shell must not undo the isolation.
+    monkeypatch.setenv("GEMINI_API_KEY", "exported-by-the-user")
+    monkeypatch.setenv("GEMINI_PROJECT", "demo")
+    result = launch("--topology", "process")
+    assert "GEMINI_API_KEY" not in result.agent_env
+    assert "GEMINI_PROJECT" not in result.agent_env
+
+
+def test_process_uses_one_free_port_for_the_proxy_and_the_agent(launch):
+    result = launch("--topology", "process")
+    argv = result.proxy_argv
+    assert argv[0] == "/usr/bin/litellm"
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    assert argv[argv.index("--port") + 1] == str(PORT)
+    assert Path(argv[argv.index("--config") + 1]).name == "config.yaml"
+    assert result.config_text == RENDERED
+    assert str(PORT) in result.agent_env["OPENAI_BASE_URL"]
+
+
+def test_process_keeps_loopback_backends_on_loopback(launch):
+    result = launch("--topology", "process")
+    assert result.rendered["backends"]["box"].api_base == "http://localhost:11434"
+
+
+def test_process_drops_the_image_only_usage_callback(launch):
+    config = launch("--topology", "process").rendered["config"]
+    assert "callbacks" not in config["litellm_settings"]
+
+
+def test_container_keeps_the_usage_callback(launch):
+    assert "callbacks" in launch().rendered["config"]["litellm_settings"]
+
+
+def test_process_stops_the_proxy_when_the_agent_exits(launch):
+    result = launch("--topology", "process")
+    assert result.proxy.terminated
+
+
+def test_process_health_timeout_stops_the_proxy_and_starts_no_agent(
+    launch, monkeypatch, capsys
+):
+    monkeypatch.setattr(topology, "_healthy", lambda url: False)
+    monkeypatch.setattr(topology, "LIVENESS_TIMEOUT", 0.0)
+    result = launch("--topology", "process")
+    err = capsys.readouterr().err
+    assert result.code == 2
+    assert result.called is False
+    assert result.proxy.terminated
+    assert "not healthy" in err and "the agent did not start" in err
+
+
+def test_wait_healthy_gives_up_as_soon_as_the_proxy_exits():
+    dead = _Proxy()
+    dead.returncode = 1
+    reason = topology._wait_healthy(dead, "http://127.0.0.1:1/health/liveliness")
+    assert "exited with status 1" in reason
+
+
+def test_a_proxy_that_ignores_sigterm_is_killed():
+    class Stubborn(_Proxy):
+        def wait(self, timeout=None):
+            if timeout is not None and not self.killed:
+                raise topology.subprocess.TimeoutExpired("litellm", timeout)
+            return self.returncode
+
+    proxy = Stubborn()
+    topology._stop(proxy)
+    assert proxy.terminated and proxy.killed
+
+
+def test_process_without_a_litellm_binary_is_a_clean_failure(launch, monkeypatch, capsys):
+    monkeypatch.setattr(topology.shutil, "which", lambda name: None)
+    result = launch("--topology", "process")
+    err = capsys.readouterr().err
+    assert result.code == 2
+    assert result.proxy is None and result.called is False
+    assert "uv tool install 'litellm[proxy]'" in err
+    assert "vendored wheels" in err
+
+
+def test_process_says_what_is_weaker_about_it(launch, capsys):
+    launch("--topology", "process")
+    err = capsys.readouterr().err
+    assert "uid" in err and "raised bar" in err
+
+
+def test_process_ca_bundle_configures_the_proxy_only(launch, monkeypatch, tmp_path):
+    for name in run.CA_VARS:
+        monkeypatch.delenv(name, raising=False)
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n")
+    result = launch("--topology", "process", "--ca-bundle", str(bundle))
+    for name in run.CA_VARS:
+        assert result.proxy_env[name] == str(bundle)
+        assert name not in result.agent_env
+
+
+def test_process_dry_run_prints_both_commands_and_starts_nothing(launch, capsys):
+    result = launch("--topology", "process", "--dry-run", "--", "aider")
+    out = capsys.readouterr().out
+    assert result.code == 0
+    assert result.called is False and result.proxy is None
+    assert RENDERED.strip() in out
+    litellm_line = next(l for l in out.splitlines() if l.startswith("/usr/bin/litellm"))
+    assert f"--port {PORT}" in litellm_line
+    assert "aider" in out.splitlines()
+    assert SECRET not in out
+
+
+# --- --topology none: the last resort -------------------------------------
+
+
+def test_none_exports_the_original_variable_names(launch):
+    result = launch("--topology", "none", "--", "aider")
+    assert result.code == 7
+    assert result.argv == ["aider"]
+    env = result.agent_env
+    assert env["GEMINI_API_KEY"] == SECRET
+    assert env["GEMINI_PROJECT"] == "demo"
+    assert NAMESPACED_KEY not in env
+    assert env["MA_PROJECT"] == "all-in"
+
+
+def test_none_warns_loudly_about_exactly_what_it_loses(launch, capsys):
+    launch("--topology", "none")
+    err = capsys.readouterr().err
+    assert "NO PROXY" in err
+    for lost in ("secret isolation", "canonical model names", "policy", "usage ledger"):
+        assert lost in err
+    assert "GEMINI_API_KEY" in err  # names the variables it is handing over
+    assert SECRET not in err
+
+
+def test_none_renders_nothing_and_starts_no_proxy(launch):
+    result = launch("--topology", "none")
+    assert "config" not in result.rendered
+    assert "backends" not in result.rendered
+    assert result.proxy is None
+
+
+def test_none_dry_run_names_the_variables_without_their_values(launch, capsys):
+    result = launch("--topology", "none", "--dry-run", "--", "aider")
+    out = capsys.readouterr().out
+    assert result.code == 0 and result.called is False
+    assert "GEMINI_API_KEY" in out and SECRET not in out
+
+
+def test_none_warns_when_two_backends_define_one_variable(tmp_path):
+    import argparse
+
+    cred_dir = tmp_path / "creds"
+    cred_dir.mkdir()
+    (cred_dir / "a.env").write_text("AWS_ACCESS_KEY_ID=one\n")
+    (cred_dir / "b.env").write_text("AWS_ACCESS_KEY_ID=two\n")
+    backends = [
+        Backend(name="a", type="bedrock", credential="a"),
+        Backend(name="b", type="bedrock", credential="b"),
+    ]
+    values, warnings = topology._direct_values(
+        argparse.Namespace(cred_dir=cred_dir), backends
+    )
+    assert values["AWS_ACCESS_KEY_ID"] == "two"
+    assert len(warnings) == 1 and "AWS_ACCESS_KEY_ID" in warnings[0]
+
+
+# --- which options belong to which topology -------------------------------
+
+
+@pytest.mark.parametrize("flag", [("--engine", "podman"), ("--image", "agents:latest")])
+def test_container_only_flags_are_errors_under_another_topology(launch, flag, capsys):
+    with pytest.raises(SystemExit) as exit:
+        launch("--topology", "process", *flag)
+    assert exit.value.code == 2
+    assert "only to --topology container" in capsys.readouterr().err
+
+
+def test_an_ambient_engine_variable_blocks_nothing(launch, monkeypatch):
+    monkeypatch.setenv("MA_CONTAINER_ENGINE", "podman")
+    assert launch("--topology", "process").code == 7
+
+
+def test_none_rejects_a_ca_bundle_rather_than_ignoring_it(launch, tmp_path, capsys):
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n")
+    with pytest.raises(SystemExit):
+        launch("--topology", "none", "--ca-bundle", str(bundle))
+    assert "--ca-bundle" in capsys.readouterr().err
+
+
+def test_topology_comes_from_the_environment(launch, monkeypatch):
+    monkeypatch.setenv("MA_TOPOLOGY", "process")
+    assert launch().proxy_argv[0] == "/usr/bin/litellm"
+
+
+def test_an_unknown_topology_in_the_environment_is_an_error(launch, monkeypatch, capsys):
+    monkeypatch.setenv("MA_TOPOLOGY", "kubernetes")
+    with pytest.raises(SystemExit):
+        launch()
+    assert "unknown topology" in capsys.readouterr().err

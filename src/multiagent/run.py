@@ -1,4 +1,8 @@
-"""`ma run`: the models pipeline, then a proxy and an agent in a container.
+"""`ma run`: the models pipeline, then a proxy and an agent.
+
+The container topology is the one described below and the default. The two
+weaker ones — proxy as a host process, or no proxy at all — live in
+topology.py; everything up to the rendered config is shared with them.
 
 Secrets travel exactly one way — credential file, per-launch env file under
 `$XDG_RUNTIME_DIR`, engine `--env-file`, the proxy process inside the
@@ -26,10 +30,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from . import credentials, registry, snapshot
+from . import credentials, registry, snapshot, topology
 from .merge import merge_backend, stale_overrides
 from .probe import probe_backend
 from .render import render_config, to_yaml
+from .topology import CA_VARS
 from .types import (
     Backend,
     Config,
@@ -46,8 +51,6 @@ CONTAINER_HOST = "host.docker.internal"
 
 CONFIG_IN_CONTAINER = "/run/ma/config.yaml"
 CA_IN_CONTAINER = "/run/ma/ca.pem"
-# Every library that might do TLS inside the container reads a different one.
-CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "AWS_CA_BUNDLE")
 PROXY_VARS = (
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
@@ -155,15 +158,16 @@ def _launch_root() -> Path | None:
     return root
 
 
-def _write_launch_dir(config_yaml: str, env_vars: dict[str, str], secrets_ok: bool) -> Path:
+def _write_launch_dir(config_yaml: str, env_vars: dict[str, str] | None) -> Path:
     """The per-launch directory: the config to mount, the env file docker reads.
 
-    `secrets_ok` is False on a dry run, which prints a plan rather than running
-    it — writing the env file then would leave secrets on disk for no launch.
+    `env_vars` is None when no env file should exist: on a dry run, which prints
+    a plan rather than running it, and in the process topology, where the
+    secrets go straight into the proxy's process environment instead.
     """
     launch_dir = Path(tempfile.mkdtemp(prefix="ma-", dir=_launch_root()))
     (launch_dir / "config.yaml").write_text(config_yaml)
-    if not secrets_ok:
+    if env_vars is None:
         return launch_dir
 
     env_path = launch_dir / "env"
@@ -281,9 +285,16 @@ def launch(args: argparse.Namespace) -> int:
         )
         return 2
 
+    project = state.config.projects.get(args.project)
+    default_model = project and project.default_model
+    if args.topology == "none":
+        return topology.run_direct(args, usable, default_model)
+
+    in_container = args.topology == "container"
     env_vars: dict[str, str] = {}
     key_env: dict[str, dict[str, str]] = {}
-    backends = {b.name: for_container(b) for b in usable}
+    # Loopback stays loopback outside a container: nothing to reach across.
+    backends = {b.name: for_container(b) if in_container else b for b in usable}
     try:
         for backend in usable:
             if not backend.credential:
@@ -292,17 +303,24 @@ def launch(args: argparse.Namespace) -> int:
             names = {var: namespaced(backend.name, var) for var in values}
             env_vars.update({names[var]: value for var, value in values.items()})
             key_env[backend.name] = names
-        config_yaml = to_yaml(render_config(backends, merged, key_env))
+        config = render_config(backends, merged, key_env)
+        if not in_container:
+            # The accounting callback module and /var/ma-usage exist only in the
+            # image; naming a module the proxy cannot import would fail its start.
+            config.get("litellm_settings", {}).pop("callbacks", None)
+        config_yaml = to_yaml(config)
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
 
-    project = state.config.projects.get(args.project)
-    launch_dir = _write_launch_dir(config_yaml, env_vars, secrets_ok=not args.dry_run)
+    write_env_file = in_container and not args.dry_run
+    launch_dir = _write_launch_dir(config_yaml, env_vars if write_env_file else None)
     try:
-        argv = _docker_argv(
-            args, launch_dir, sorted(env_vars), project and project.default_model
-        )
+        if args.topology == "process":
+            return topology.run_process(
+                args, launch_dir, config_yaml, env_vars, key_env, default_model
+            )
+        argv = _docker_argv(args, launch_dir, sorted(env_vars), default_model)
         if args.dry_run:
             print(config_yaml)
             print(shlex.join(argv))
