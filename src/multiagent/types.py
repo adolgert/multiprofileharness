@@ -32,10 +32,26 @@ FACTS = (
     "tools",
     "vision",
     "mode",
-    "tokenizer",
     "input_per_mtok",
     "output_per_mtok",
 )
+
+# Our fact name -> LiteLLM's spelling for it, in one place because the catalog
+# we read and the proxy config we write use the same vocabulary in opposite
+# directions: merge.py reads this right-to-left, render.py left-to-right.
+LITELLM_FIELDS = {
+    "context": "max_input_tokens",
+    "max_output": "max_output_tokens",
+    "tools": "supports_function_calling",
+    "vision": "supports_vision",
+    "mode": "mode",
+}
+# Same, except LiteLLM states prices per token and we state them per million;
+# the 1e6 belongs with whoever converts, not with the table.
+LITELLM_PRICES = {
+    "input_per_mtok": "input_cost_per_token",
+    "output_per_mtok": "output_cost_per_token",
+}
 
 
 class ConfigError(Exception):
@@ -51,6 +67,7 @@ class Backend:
     credential: str | None = None  # credential NAME, resolved locally; never a value
     models: list[str] = field(default_factory=list)  # static served ids
     region: str | None = None
+    extra: dict = field(default_factory=dict)  # passed through into litellm_params
 
 
 @dataclass
@@ -63,7 +80,6 @@ class Project:
 
 @dataclass
 class ModelEntry:
-    name: str  # canonical name
     match: list[str] = field(default_factory=list)  # fnmatch patterns over served ids
     facts: dict = field(default_factory=dict)
     catalog_key: str | None = None  # explicit key into the vendored catalog
@@ -71,15 +87,22 @@ class ModelEntry:
 
 @dataclass
 class ModelKnowledge:
-    models: dict[str, ModelEntry] = field(default_factory=dict)
+    models: dict[str, ModelEntry] = field(default_factory=dict)  # canonical name -> entry
     # backend name -> served id -> facts
     deployments: dict[str, dict[str, dict]] = field(default_factory=dict)
 
     def canonical_for(self, served_id: str) -> str | None:
-        for entry in self.models.values():
-            if any(fnmatch(served_id, pat) for pat in entry.match):
-                return entry.name
-        return None
+        """The entry whose matching pattern is most specific, longest pattern first.
+
+        Specificity is length, so `llava:34b` beats the `llava:*` that would
+        otherwise shadow it whatever order the file lists them in.
+        """
+        best, best_length = None, -1
+        for name, entry in self.models.items():
+            for pattern in entry.match:
+                if fnmatch(served_id, pattern) and len(pattern) > best_length:
+                    best, best_length = name, len(pattern)
+        return best
 
 
 @dataclass
@@ -108,10 +131,11 @@ class Conflict:
     fact: str
     believed: object
     observed: object
+    winner: str  # "observed" or "override": which value the merge actually used
 
 
 @dataclass
-class MergedModel:
+class Deployment:
     backend: str
     served_id: str
     canonical: str | None  # None: probed but models.yaml has no entry

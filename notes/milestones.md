@@ -1,7 +1,8 @@
 # Milestones
 
 Each milestone extends the launch pipeline one stage further and states what
-can be exercised at home versus what waits for work. Milestone 1 is done.
+can be exercised at home versus what waits for work. M1 and M2 are done; M3 is
+done as far as home hardware allows.
 
 ## M1 — `ma models` (done)
 
@@ -10,47 +11,65 @@ endpoints, diff against the last-seen snapshot, merge facts with precedence
 and conflict reporting, print the table. 76 tests; verified live against
 ollama through both its native API and its OpenAI-compatible facade.
 
-## M2 — `ma run`: render and launch (fully exercisable at home)
+## M2 — `ma run`: render and launch (done)
 
 The pipeline's remaining stages, in the home topology (proxy inside the agent
 container):
 
-- Render a LiteLLM `config.yaml` from the merged table: routes under
-  canonical model names, secrets as `os.environ/VAR` references (never
-  values), merged prices and `model_info` so spend logging prices each
-  request.
+- Render a LiteLLM `config.yaml` from the merged Deployments: routes under
+  canonical model names, secrets as `os.environ/MA_<BACKEND>_<VAR>`
+  references (never values), merged prices and `model_info` so spend logging
+  prices each request, duplicate canonical names rejected at render time.
 - Entrypoint: start LiteLLM with provider env vars, generate a per-launch
   master key, scrub provider vars from the environment, `exec` the agent.
-- `ma run --project X -- <agent command>`: one `docker run` composing
-  env-file(secrets) + config(ro) + workspace mount.
+- `ma run --project X -- <agent command>`: one engine invocation composing
+  env-file(secrets, not mounted) + config(ro at `/run/ma/config.yaml`) +
+  workspace mount + per-project ledger mount, as the invoking uid/gid with
+  capabilities dropped, launch dir under `$XDG_RUNTIME_DIR`.
 - Usage JSONL per project/machine (tokens, model, cost — never prompts).
-- Verify with a real agent (`aider` or `claude`) talking through the proxy to
-  ollama and one hosted API; verify the gov-slip guard: from `paper-review`,
-  a request naming a Gemini model must fail as unreachable.
+- Verified with a real agent talking through the proxy to ollama and one
+  hosted API, and the gov-slip guard checked: from `paper-review`, a request
+  naming a Gemini model fails as unreachable.
 
 Tests: render as a pure function (config in → YAML out, asserted no secret
 values in output); entrypoint scrub asserted by reading the agent's
 environment; an end-to-end smoke against ollama.
 
-## M3 — Bedrock adapter and `ma keys` (partially exercisable at home)
+## M3 — Bedrock adapter and `ma keys` (home scope done; work scope open)
 
-- `type: bedrock` adapter: region, partition, Mantle endpoint rendered into
-  `litellm_params`; four registry entries and four credential names for the
-  work accounts (projA/projB × gov/com).
+Done:
+
+- `type: bedrock` adapter: region and partition rendered into
+  `litellm_params`, with explicit per-backend
+  `aws_access_key_id`/`aws_secret_access_key`/`aws_session_token`
+  `os.environ` references so two accounts × two partitions cannot sign each
+  other's requests. Mantle needs no adapter work — its `endpoint_url` rides
+  the backend entry's `extra:` passthrough. Four registry entries and four
+  credential names for the work accounts (projA/projB × gov/com).
 - `ma keys`: the morning ritual — write short-term AWS credentials into the
   credential files; staleness warning when a short-term file is older than N
   hours.
+- Home validation: rendered-config unit tests, plus live-fire of the
+  commercial path with the home Bedrock account on a morning keys were
+  fetched.
+
+Remaining, and both need work hardware:
+
 - Sidecar-proxy topology (proxy in its own container on a per-launch
   network), so the agent container never holds provider secrets — gov
   credentials get the wall, not the raised bar.
-- Home validation: rendered-config unit tests now; live-fire the commercial
-  path with the home Bedrock account on a morning keys are fetched. GovCloud
-  specifics confirm only at work.
+- GovCloud validation: endpoints, model ids, and prices confirm only at work.
 
 ## M4 — Portability and work install (simulatable at home)
 
-- Plain-process proxy fallback for machines without Docker, and the loud
-  "no proxy, env vars exported directly" degraded mode.
+- Plain-process proxy fallback for machines without a container engine, and
+  the loud "no proxy, env vars exported directly" degraded mode.
+- **Image transport into the work network.** The agent image cannot be pulled
+  there, so build it at home, `docker save | zstd` it to a tarball, measure
+  the size on home hardware, and document the `docker load` (and `podman
+  load`) path end to end, including where the tarball is allowed to travel.
+  This is a first-class deliverable, not a footnote: without it the whole
+  container topology is unavailable at work and M4's gate is unmet.
 - Vendored wheels; verify `uv`-based offline install with networking off.
 - Refresh story for the vendored price catalog (deliberate, dated).
 - A short coworker-onboarding doc: clone shared config, create credential

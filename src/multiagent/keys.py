@@ -14,7 +14,12 @@ from pathlib import Path
 
 from .types import ConfigError, credentials_dir
 
-HINT = "install awscli or check the profile"
+def hint(profile: str) -> str:
+    """What to try next. Expiry is the usual cause, so the login comes first."""
+    return (
+        f"try `aws sso login --profile {profile}`, "
+        "or install awscli and check that the profile exists"
+    )
 
 
 def fetch(profile: str) -> dict:
@@ -25,29 +30,33 @@ def fetch(profile: str) -> dict:
         "--format", "process",
     ]
     try:
-        result = subprocess.run(argv, capture_output=True, text=True)
+        # stdout is captured because it holds the secret; stderr is inherited so
+        # that an MFA or SSO prompt reaches the terminal the user is sitting at.
+        result = subprocess.run(argv, stdout=subprocess.PIPE, text=True)
     except OSError as exc:  # no `aws` on PATH, or it is not executable
-        raise ConfigError(f"cannot run 'aws' for profile {profile!r} ({exc}); {HINT}") from None
+        raise ConfigError(
+            f"cannot run 'aws' for profile {profile!r} ({exc}); {hint(profile)}"
+        ) from None
 
     if result.returncode != 0:
-        detail = " ".join((result.stderr or "").split())[:300]
         raise ConfigError(
-            f"aws export-credentials failed for profile {profile!r}"
-            + (f": {detail}" if detail else "")
-            + f"; {HINT}"
+            f"aws export-credentials failed for profile {profile!r} "
+            f"(exit {result.returncode}; its own message is above); {hint(profile)}"
         )
 
     try:
         creds = json.loads(result.stdout)
     except ValueError:
         raise ConfigError(
-            f"aws export-credentials returned no usable JSON for profile {profile!r}; {HINT}"
+            f"aws export-credentials returned no usable JSON for profile {profile!r}; "
+            f"{hint(profile)}"
         ) from None
 
     missing = [f for f in ("AccessKeyId", "SecretAccessKey") if not creds.get(f)]
     if missing:
         raise ConfigError(
-            f"aws export-credentials for profile {profile!r} omitted {', '.join(missing)}; {HINT}"
+            f"aws export-credentials for profile {profile!r} omitted "
+            f"{', '.join(missing)}; {hint(profile)}"
         )
     return creds
 
@@ -55,7 +64,10 @@ def fetch(profile: str) -> dict:
 def write_credential(name: str, creds: dict, cred_dir: Path | None = None) -> Path:
     """Write `<cred_dir>/<name>.env`, mode 0600, and return its path."""
     directory = cred_dir or credentials_dir()
-    directory.mkdir(parents=True, exist_ok=True)
+    # Which credentials this machine holds is itself worth hiding, so the
+    # directory is private too, whether we create it or inherit it.
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
     path = directory / f"{name}.env"
 
     lines = []

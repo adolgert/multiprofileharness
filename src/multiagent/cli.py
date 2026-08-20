@@ -9,16 +9,16 @@ point into a container (see run.py).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from . import keys, run
-from .probe import probe_backend
 from .types import ConfigError, config_home, state_home
 
 DASH = "—"
 COLUMNS = ("backend", "credential", "status", "model", "ctx", "tools", "price", "note")
-STATUS = {"live": "live", "down": "down", "static": "ok"}
+BLANK = (DASH,) * 4  # model, ctx, tools, price: nothing to say about any of them
 
 
 def format_table(headers, rows) -> str:
@@ -73,9 +73,7 @@ def _join(*parts: str) -> str:
 
 def _models(args: argparse.Namespace) -> int:
     try:
-        # Passed explicitly: probing is the one step that touches the network,
-        # so it is the one a caller may want to stand in for.
-        state = run.pipeline(args, probe_backend)
+        state = run.pipeline(args)
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
@@ -95,26 +93,29 @@ def _models(args: argparse.Namespace) -> int:
             change_cell = f"changed ({len(change)})"
 
         if state.cred_status[name] == "missing":
-            rows.append((name, credential, "NO KEY", DASH, DASH, DASH, DASH, change_cell))
+            rows.append((name, credential, "NO KEY", *BLANK, change_cell))
             continue
 
         result = state.probes[name]
         if result.status == "down":
             rows.append(
-                (name, credential, "down", DASH, DASH, DASH, DASH,
+                (name, credential, "down", *BLANK,
                  _join(_short(result.error), change_cell))
             )
             continue
 
         merged = state.merged[name]
         # An expired key still answers for a while; the loud cell is the warning,
-        # so the backend is probed and rendered exactly as usual.
+        # so the backend is probed and rendered exactly as usual. `listed` and
+        # `live` are different claims: `live` means the endpoint answered,
+        # `listed` means we copied a curated list and checked nothing.
         status = (
             "STALE" if state.cred_status[name] == "stale"
-            else STATUS.get(result.status, result.status)
+            else "listed" if result.status == "static"
+            else result.status
         )
         if not merged:
-            rows.append((name, credential, status, DASH, DASH, DASH, DASH, change_cell))
+            rows.append((name, credential, status, *BLANK, change_cell))
             continue
 
         for model in merged:
@@ -142,12 +143,13 @@ def _models(args: argparse.Namespace) -> int:
 
     details = [
         f"conflict {m.backend}/{m.served_id} {c.fact}: "
-        f"believed {c.believed}, observed {c.observed} (observed wins)"
+        f"believed {c.believed}, observed {c.observed} ({c.winner} wins)"
         for m, c in conflicts
     ]
     for name, lines in changes.items():
         if len(lines) > 1:  # the single-note case is already in the table
             details += [f"change {name}: {line}" for line in lines]
+    details += [f"stale: {note}" for note in state.stale]
     if details:
         print()
         for line in details:
@@ -168,8 +170,38 @@ def _keys(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_config(explicit: Path | None) -> Path:
+    """Find the shared config directory. The working directory is the LAST resort.
+
+    backends.yaml binds credential NAMES to destination URLs, so whoever can
+    edit it can point a credential at a host they control. A `config/` in a repo
+    cloned an hour ago must not win over the user's own, and must say so when it
+    does win.
+    """
+    if explicit is not None:
+        return explicit
+    tried = ["--config (not given)"]
+
+    from_env = os.environ.get("MA_CONFIG")
+    if from_env:
+        return Path(from_env)
+    tried.append("$MA_CONFIG (not set)")
+
+    for candidate, note in (
+        (config_home() / "config", None),
+        (Path("config"), "using {} from the workspace — the workspace is untrusted input"),
+    ):
+        if candidate.is_dir():
+            if note:
+                print(f"warning: {note.format(candidate)}", file=sys.stderr)
+            return candidate
+        tried.append(str(candidate))
+
+    raise ConfigError("no config directory found; tried: " + ", ".join(tried))
+
+
 def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", type=Path, default=Path("config"), help="shared config dir")
+    parser.add_argument("--config", type=Path, default=None, help="shared config dir")
     parser.add_argument("--machine", type=Path, default=config_home() / "machine.yaml")
     parser.add_argument("--state", type=Path, default=state_home() / "last-seen.json")
     parser.add_argument("--cred-dir", type=Path, default=None, help="credential .env dir")
@@ -204,9 +236,19 @@ def main(argv=None) -> int:
     _common(runner)
     runner.add_argument("--image", default="multiagent", help="agent container image")
     runner.add_argument(
+        "--engine",
+        default=os.environ.get("MA_CONTAINER_ENGINE", "docker"),
+        help="container engine (default: $MA_CONTAINER_ENGINE or docker)",
+    )
+    runner.add_argument(
+        "--ca-bundle",
+        type=Path,
+        help="corporate CA to trust inside the container, instead of disabling TLS checks",
+    )
+    runner.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the proxy config and the docker command, then stop",
+        help="print the proxy config and the engine command, then stop",
     )
     runner.set_defaults(func=run.launch)
 
@@ -223,4 +265,10 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
     args.agent = agent or ["bash"]
+    if hasattr(args, "config"):
+        try:
+            args.config = resolve_config(args.config)
+        except ConfigError as exc:
+            print(exc, file=sys.stderr)
+            return 2
     return args.func(args)

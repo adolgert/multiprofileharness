@@ -5,16 +5,25 @@ is usually looking at a typo in YAML someone else committed.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+from dataclasses import fields
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
 from .types import FACTS, Backend, Config, ConfigError, ModelEntry, ModelKnowledge, Project
 
-BACKEND_KEYS = {"type", "api_base", "discovery", "credential", "models", "region"}
-PROJECT_KEYS = {"backends", "model_filter", "default_model"}
+# The YAML keys are the dataclass fields, minus the name each entry is filed
+# under, so a new field is configurable the moment it exists.
+BACKEND_KEYS = {f.name for f in fields(Backend)} - {"name"}
+PROJECT_KEYS = {f.name for f in fields(Project)} - {"name"}
 MODEL_KEYS = {"match", "catalog_key"} | set(FACTS)
+
+# Types probe.py knows how to interrogate; `discovery: dynamic` on any other
+# would silently report the backend as down.
+PROBEABLE = {"ollama", "openai-compat"}
 
 
 def _load_yaml(path: Path, *, required: bool) -> dict:
@@ -59,6 +68,32 @@ def _check_keys(raw: dict, allowed: set[str], path: Path, name: str) -> None:
             )
 
 
+def _is_local(host: str) -> bool:
+    """A host reachable only from this machine or this network."""
+    if host in ("localhost", "host.docker.internal") or "." not in host:
+        return True  # a dotless name is a LAN or /etc/hosts name, not a public one
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private
+
+
+def _check_tls(backend: Backend, path: Path) -> None:
+    """Refuse to send a credential in the clear to a host off this network."""
+    if not backend.credential or not backend.api_base:
+        return
+    parts = urlsplit(backend.api_base)
+    if parts.scheme != "http" or _is_local(parts.hostname or ""):
+        return
+    raise ConfigError(
+        f"{path}: backend {backend.name!r} needs credential {backend.credential!r} "
+        f"but its api_base is plain http:// to {parts.hostname!r}, which would send "
+        f"that credential over the network as cleartext. Use https, or address the "
+        f"backend on loopback or a private address. Fix {path}."
+    )
+
+
 def _str_list(value: object, path: Path, name: str, key: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ConfigError(f"{path}: entry {name!r} key {key!r} must be a list of strings")
@@ -81,15 +116,27 @@ def load_config(config_dir: Path) -> Config:
         _check_keys(raw, BACKEND_KEYS, backends_path, name)
         if not raw.get("type"):
             raise ConfigError(f"{backends_path}: backend {name!r} is missing required key 'type'")
+        discovery = raw.get("discovery", "static")
+        if discovery == "dynamic" and raw["type"] not in PROBEABLE:
+            raise ConfigError(
+                f"{backends_path}: backend {name!r} is type {raw['type']!r} and cannot be "
+                f"probed; only {sorted(PROBEABLE)} support 'discovery: dynamic'. "
+                f"List its models under 'models:' instead. Fix {backends_path}."
+            )
+        extra = raw.get("extra") or {}
+        if not isinstance(extra, dict):
+            raise ConfigError(f"{backends_path}: entry {name!r} key 'extra' must be a mapping")
         backends[name] = Backend(
             name=name,
             type=raw["type"],
             api_base=raw.get("api_base"),
-            discovery=raw.get("discovery", "static"),
+            discovery=discovery,
             credential=raw.get("credential"),
             models=_str_list(raw.get("models", []), backends_path, name, "models"),
             region=raw.get("region"),
+            extra=dict(extra),
         )
+        _check_tls(backends[name], backends_path)
 
     projects: dict[str, Project] = {}
     raw_projects = _section(
@@ -128,7 +175,6 @@ def load_config(config_dir: Path) -> Config:
         raw = _entry(raw, models_path, name)
         _check_keys(raw, MODEL_KEYS, models_path, name)
         knowledge.models[name] = ModelEntry(
-            name=name,
             match=_str_list(raw.get("match", []), models_path, name, "match"),
             facts={k: v for k, v in raw.items() if k in FACTS},
             catalog_key=raw.get("catalog_key"),
@@ -148,6 +194,18 @@ def load_config(config_dir: Path) -> Config:
             facts = _entry(facts, models_path, label)
             _check_keys(facts, set(FACTS), models_path, label)
             knowledge.deployments[backend_name][served_id] = dict(facts)
+
+    # Checked once models.yaml is loaded: a filter names canonical names, and a
+    # typo there silently authorizes nothing rather than loudly authorizing the
+    # wrong thing.
+    for name, project in projects.items():
+        for model_name in project.model_filter or []:
+            if model_name not in knowledge.models:
+                raise ConfigError(
+                    f"{projects_path}: project {name!r} filters on model {model_name!r}, "
+                    f"which is not defined in {models_path}. "
+                    f"Known models: {sorted(knowledge.models)}."
+                )
 
     catalog: dict = {}
     if catalog_path.exists():
@@ -182,4 +240,5 @@ def apply_machine(config: Config, machine_path: Path) -> Config:
                 )
         if "api_base" in raw:
             config.backends[name].api_base = raw["api_base"]
+            _check_tls(config.backends[name], machine_path)
     return config

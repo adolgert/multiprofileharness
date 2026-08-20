@@ -1,46 +1,65 @@
 """Render the LiteLLM proxy config.
 
 Clean by construction: a secret never enters this module. Callers pass
-`key_env`, a backend name -> environment variable NAME map, and the only thing
-rendered is the string `os.environ/VARNAME`, which LiteLLM resolves in the
-proxy process. The output is therefore always safe to print, diff, and attach
-to a bug report.
+`key_env`, a backend name -> {original variable NAME: namespaced variable
+NAME} map, and the only thing rendered is the string `os.environ/VARNAME`,
+which LiteLLM resolves in the proxy process. The output is therefore always
+safe to print, diff, and attach to a bug report.
+
+Every route names the variables it uses, per backend. That is load-bearing for
+Bedrock: `AWS_*` is process-global, so two accounts in one proxy would
+otherwise sign every request with whichever set won, silently.
 """
 from __future__ import annotations
 
 import yaml
 
-from .types import Backend, ConfigError, MergedModel
+from . import credentials
+from .probe import ensure_v1
+from .types import LITELLM_FIELDS, LITELLM_PRICES, Backend, ConfigError, Deployment
 
-# Our fact name -> LiteLLM model_info field. Prices are handled separately.
-_INFO_FIELDS = {
-    "context": "max_input_tokens",
-    "max_output": "max_output_tokens",
-    "tools": "supports_function_calling",
-    "vision": "supports_vision",
-    "mode": "mode",
-}
-_INFO_PRICES = {
-    "input_per_mtok": "input_cost_per_token",
-    "output_per_mtok": "output_cost_per_token",
+# litellm_params name -> the credential-file variable that fills it.
+AWS_PARAMS = {
+    "aws_access_key_id": "AWS_ACCESS_KEY_ID",
+    "aws_secret_access_key": "AWS_SECRET_ACCESS_KEY",
+    "aws_session_token": "AWS_SESSION_TOKEN",  # short-term keys only
 }
 
 
-def _key_ref(backend: Backend, key_env: dict[str, str]) -> str:
-    var = key_env.get(backend.name)
-    if not var:
-        raise ConfigError(f"backend {backend.name!r} needs a key but no env var was given for it")
-    return f"os.environ/{var}"
+def _names(backend: Backend, key_env: dict[str, dict[str, str]]) -> dict[str, str]:
+    names = key_env.get(backend.name)
+    if not names:
+        raise ConfigError(
+            f"backend {backend.name!r} needs a key but no env var was given for it"
+        )
+    return names
 
 
-def _v1(api_base: str | None) -> str | None:
-    if api_base is None:
-        return None
-    base = api_base.rstrip("/")
-    return base if base.endswith("/v1") else f"{base}/v1"
+def _key_ref(backend: Backend, key_env: dict[str, dict[str, str]]) -> str:
+    names = _names(backend, key_env)
+    var = credentials.key_var(names, source=f"credential {backend.credential!r}")
+    return f"os.environ/{names[var]}"
 
 
-def _params(backend: Backend, model: MergedModel, key_env: dict[str, str]) -> dict:
+def _aws_params(backend: Backend, key_env: dict[str, dict[str, str]]) -> dict:
+    names = _names(backend, key_env)
+    missing = [
+        var for param, var in AWS_PARAMS.items()
+        if var not in names and param != "aws_session_token"
+    ]
+    if missing:
+        raise ConfigError(
+            f"backend {backend.name!r} is bedrock but credential "
+            f"{backend.credential!r} defines no {' or '.join(missing)}"
+        )
+    return {
+        param: f"os.environ/{names[var]}"
+        for param, var in AWS_PARAMS.items()
+        if var in names
+    }
+
+
+def _params(backend: Backend, model: Deployment, key_env: dict[str, dict[str, str]]) -> dict:
     served = model.served_id
     if backend.type == "ollama":
         # ollama_chat is chat-only; embeddings must go through the plain route.
@@ -49,7 +68,7 @@ def _params(backend: Backend, model: MergedModel, key_env: dict[str, str]) -> di
     if backend.type == "openai-compat":
         return {
             "model": f"openai/{served}",
-            "api_base": _v1(backend.api_base),
+            "api_base": ensure_v1(backend.api_base) if backend.api_base else None,
             # The OpenAI client refuses to send without a key, even to a local
             # server that ignores it.
             "api_key": _key_ref(backend, key_env) if backend.credential else "dummy",
@@ -59,36 +78,67 @@ def _params(backend: Backend, model: MergedModel, key_env: dict[str, str]) -> di
     if backend.type == "anthropic":
         return {"model": f"anthropic/{served}", "api_key": _key_ref(backend, key_env)}
     if backend.type == "bedrock":
-        # No api_key: the proxy's boto3 signs with the AWS_* variables the
-        # launcher's env file delivers, so there is no key name to reference.
         if not backend.region:
             raise ConfigError(f"backend {backend.name!r} is bedrock and needs a region")
-        return {"model": f"bedrock/{served}", "aws_region_name": backend.region}
+        return {
+            "model": f"bedrock/{served}",
+            "aws_region_name": backend.region,
+            **_aws_params(backend, key_env),
+        }
     raise ConfigError(f"backend {backend.name!r} has unsupported type {backend.type!r}")
 
 
 def _model_info(facts: dict) -> dict:
-    info = {theirs: facts[ours] for ours, theirs in _INFO_FIELDS.items() if ours in facts}
-    for ours, theirs in _INFO_PRICES.items():
+    info = {theirs: facts[ours] for ours, theirs in LITELLM_FIELDS.items() if ours in facts}
+    for ours, theirs in LITELLM_PRICES.items():
         if ours in facts:
             info[theirs] = facts[ours] / 1e6
     return info
 
 
+def _check_unique(model_list: list[dict], merged: list[Deployment]) -> None:
+    """LiteLLM load-balances same-name entries; a collision must not be silent."""
+    owners: dict[str, list[str]] = {}
+    for entry, model in zip(model_list, merged):
+        owners.setdefault(entry["model_name"], []).append(
+            f"({model.backend}, {model.served_id})"
+        )
+    duplicates = {name: who for name, who in owners.items() if len(who) > 1}
+    if duplicates:
+        detail = "; ".join(
+            f"{name}: {', '.join(who)}" for name, who in sorted(duplicates.items())
+        )
+        raise ConfigError(
+            f"two deployments claim the same model name, which LiteLLM would read as a "
+            f"load-balancing group and spread requests across: {detail}. "
+            f"Give them different canonical names in models.yaml."
+        )
+
+
 def render_config(
-    backends: dict[str, Backend], merged: list[MergedModel], key_env: dict[str, str]
+    backends: dict[str, Backend],
+    merged: list[Deployment],
+    key_env: dict[str, dict[str, str]],
 ) -> dict:
-    """Build the proxy config dict; `key_env` maps backend name -> env var NAME."""
+    """Build the proxy config dict.
+
+    `key_env` maps a backend name to {credential variable NAME: the namespaced
+    NAME it carries into the container}.
+    """
     model_list = []
     for model in merged:
         backend = backends[model.backend]
+        params = _params(backend, model, key_env)
+        # Last, and verbatim: the escape hatch outranks what the adapter guessed.
+        params.update(backend.extra)
         model_list.append(
             {
                 "model_name": model.canonical or model.served_id,
-                "litellm_params": _params(backend, model, key_env),
+                "litellm_params": params,
                 "model_info": _model_info(model.facts),
             }
         )
+    _check_unique(model_list, merged)
     return {
         "model_list": model_list,
         "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
@@ -96,6 +146,7 @@ def render_config(
             "drop_params": True,
             # The callback module ships in the proxy image; this string is the contract.
             "callbacks": "custom_callbacks.proxy_handler_instance",
+            "telemetry": False,
         },
     }
 

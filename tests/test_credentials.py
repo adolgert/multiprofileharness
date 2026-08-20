@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
-from multiagent.credentials import expires_at, parse_env_file, resolve, status
-from multiagent.types import Backend
+import pytest
+
+from multiagent.credentials import expires_at, key_var, parse_env_file, path, resolve, status
+from multiagent.types import Backend, ConfigError
 
 AWS = Backend(name="aws-gov", type="bedrock", credential="aws-gov-keys", region="us-gov-west-1")
 
@@ -50,6 +52,44 @@ def test_resolve_reads_named_file(tmp_path):
 
 def test_resolve_missing_returns_none(tmp_path):
     assert resolve("nope", tmp_path) is None
+
+
+def test_path_is_name_dot_env_in_the_credential_dir(tmp_path):
+    assert path("gemini-api-key", tmp_path) == tmp_path / "gemini-api-key.env"
+
+
+# --- key_var --------------------------------------------------------------
+
+
+def test_key_var_picks_the_single_api_key_among_others():
+    assert key_var({"GEMINI_API_KEY": "x", "GEMINI_PROJECT": "demo"}) == "GEMINI_API_KEY"
+
+
+def test_key_var_takes_a_lone_variable_that_is_not_named_api_key():
+    assert key_var({"WORK_VLLM_TOKEN": "x"}) == "WORK_VLLM_TOKEN"
+
+
+def test_key_var_refuses_to_choose_between_two_api_keys():
+    with pytest.raises(ConfigError) as exc:
+        key_var({"A_API_KEY": "x", "B_API_KEY": "y"}, "creds/work.env")
+    assert "_API_KEY" in str(exc.value) and "A_API_KEY" in str(exc.value)
+    assert "creds/work.env" in str(exc.value)  # which file to go fix
+
+
+def test_key_var_refuses_to_guess_among_several_unnamed_variables():
+    with pytest.raises(ConfigError):
+        key_var({"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"})
+
+
+def test_key_var_refuses_an_empty_credential_file():
+    with pytest.raises(ConfigError):
+        key_var({})
+
+
+def test_key_var_error_never_quotes_a_value():
+    with pytest.raises(ConfigError) as exc:
+        key_var({"A_API_KEY": "sk-secret-value", "B_API_KEY": "sk-other-value"})
+    assert "secret-value" not in str(exc.value)
 
 
 def test_status_none_when_backend_needs_no_credential(tmp_path):

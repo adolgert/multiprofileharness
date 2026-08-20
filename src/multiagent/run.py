@@ -1,36 +1,41 @@
 """`ma run`: the models pipeline, then a proxy and an agent in a container.
 
-Secrets travel exactly one way — credential file, per-launch env file, docker
-`--env-file`, the proxy process inside the container — and the entrypoint drops
-them before the agent starts. So: no value ever reaches argv (which `ps` shows
-to every user on the box), the rendered config carries only `os.environ/NAME`
-references, and the launch directory lives outside the mounted workspace, which
-is the agent's readable surface.
+Secrets travel exactly one way — credential file, per-launch env file under
+`$XDG_RUNTIME_DIR`, engine `--env-file`, the proxy process inside the
+container — and the entrypoint drops them before the agent starts. So: no value
+ever reaches argv (which `ps` shows to every user on the box), the rendered
+config carries only `os.environ/NAME` references, and the env file is never
+mounted — only the rendered config is.
+
+Every credential variable is renamed `MA_<BACKEND>_<VAR>` on the way in, so no
+two backends can collide on a variable name. `AWS_*` is process-global: two
+Bedrock accounts under those names means one silently signs for both.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from . import credentials, registry, snapshot
-from .merge import merge_backend
+from .merge import merge_backend, stale_overrides
 from .probe import probe_backend
 from .render import render_config, to_yaml
 from .types import (
     Backend,
     Config,
     ConfigError,
-    MergedModel,
+    Deployment,
     ProbeResult,
-    Project,
     state_home,
 )
 
@@ -39,18 +44,42 @@ from .types import (
 LOOPBACK = ("localhost", "127.0.0.1")
 CONTAINER_HOST = "host.docker.internal"
 
+CONFIG_IN_CONTAINER = "/run/ma/config.yaml"
+CA_IN_CONTAINER = "/run/ma/ca.pem"
+# Every library that might do TLS inside the container reads a different one.
+CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "AWS_CA_BUNDLE")
+PROXY_VARS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+)
+
 
 @dataclass
 class Pipeline:
     """Everything both `ma models` and `ma run` learn before they diverge."""
 
     config: Config
-    project: Project | None
     backends: list[Backend]
-    cred_status: dict[str, str]  # backend name -> none | ok | missing
+    cred_status: dict[str, str]  # backend name -> none | ok | stale | missing
     probes: dict[str, ProbeResult]  # only backends whose credential resolved
     changes: dict[str, list[str]]  # backend name -> notes since last look
-    merged: dict[str, list[MergedModel]] = field(default_factory=dict)
+    merged: dict[str, list[Deployment]]
+    stale: list[str]  # deployment overrides matching nothing served now
+
+
+def namespaced(backend: str, var: str) -> str:
+    """`MA_<BACKEND>_<VAR>`: the name this credential variable travels under."""
+    return f"MA_{re.sub(r'[^A-Za-z0-9]', '_', backend).upper()}_{var}"
+
+
+def _probe_key(backend: Backend, cred_dir: Path | None) -> str | None:
+    """The bearer token a dynamic probe should send, if the backend has one."""
+    if backend.discovery != "dynamic" or not backend.credential:
+        return None
+    values = credentials.resolve(backend.credential, cred_dir)
+    if not values:
+        return None
+    return values[credentials.key_var(values, source=f"credential {backend.credential!r}")]
 
 
 def pipeline(args: argparse.Namespace, probe=None) -> Pipeline:
@@ -63,7 +92,7 @@ def pipeline(args: argparse.Namespace, probe=None) -> Pipeline:
     config = registry.apply_machine(registry.load_config(args.config), args.machine)
 
     if args.project is None:
-        project, backends = None, list(config.backends.values())
+        backends = list(config.backends.values())
     else:
         project = config.projects.get(args.project)
         if project is None:
@@ -75,7 +104,9 @@ def pipeline(args: argparse.Namespace, probe=None) -> Pipeline:
 
     cred_status = {b.name: credentials.status(b, args.cred_dir) for b in backends}
     probes = {
-        b.name: probe(b) for b in backends if cred_status[b.name] != "missing"
+        b.name: probe(b, api_key=_probe_key(b, args.cred_dir))
+        for b in backends
+        if cred_status[b.name] != "missing"
     }
 
     previous = snapshot.load(args.state)
@@ -83,23 +114,20 @@ def pipeline(args: argparse.Namespace, probe=None) -> Pipeline:
     changes = snapshot.diff(previous, current)
     snapshot.save(args.state, {**previous, **current})
 
-    merged: dict[str, list[MergedModel]] = {}
+    merged: dict[str, list[Deployment]] = {}
+    stale: list[str] = []
+    model_filter = None if args.project is None else project.model_filter
     for backend in backends:
         result = probes.get(backend.name)
         if result is None or result.status == "down":
             continue
+        stale += stale_overrides(backend, result, config.knowledge)
         models = merge_backend(backend, result, config.knowledge, config.catalog)
-        if project is not None and project.model_filter is not None:
-            models = [m for m in models if m.canonical in project.model_filter]
+        if model_filter is not None:
+            models = [m for m in models if m.canonical in model_filter]
         merged[backend.name] = models
 
-    return Pipeline(config, project, backends, cred_status, probes, changes, merged)
-
-
-def key_var(values: dict[str, str]) -> str | None:
-    """The variable in a credential file that holds the key the proxy sends."""
-    names = sorted(values)
-    return next((n for n in names if n.endswith("_API_KEY")), names[0] if names else None)
+    return Pipeline(config, backends, cred_status, probes, changes, merged, stale)
 
 
 def for_container(backend: Backend) -> Backend:
@@ -113,10 +141,30 @@ def for_container(backend: Backend) -> Backend:
     return replace(backend, api_base=urlunsplit(parts._replace(netloc=netloc)))
 
 
-def _write_launch_dir(config_yaml: str, env_vars: dict[str, str]) -> Path:
-    """The per-launch directory: the config to mount, the env file docker reads."""
-    launch_dir = Path(tempfile.mkdtemp(prefix="ma-"))
+def _launch_root() -> Path | None:
+    """Where per-launch directories go: tmpfs, per-user, cleared at logout.
+
+    Falling back to the system tempdir keeps the tool working where the runtime
+    dir is not set, at the cost of secrets that outlive a crash until reboot.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return None
+    root = Path(runtime) / "multiagent"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
+def _write_launch_dir(config_yaml: str, env_vars: dict[str, str], secrets_ok: bool) -> Path:
+    """The per-launch directory: the config to mount, the env file docker reads.
+
+    `secrets_ok` is False on a dry run, which prints a plan rather than running
+    it — writing the env file then would leave secrets on disk for no launch.
+    """
+    launch_dir = Path(tempfile.mkdtemp(prefix="ma-", dir=_launch_root()))
     (launch_dir / "config.yaml").write_text(config_yaml)
+    if not secrets_ok:
+        return launch_dir
 
     env_path = launch_dir / "env"
     env_path.touch(mode=0o600)  # created empty and private, then filled
@@ -126,23 +174,94 @@ def _write_launch_dir(config_yaml: str, env_vars: dict[str, str]) -> Path:
     return launch_dir
 
 
-def _docker_argv(args: argparse.Namespace, launch_dir: Path, scrub: list[str]) -> list[str]:
-    usage_dir = state_home() / "usage"
+def _docker_argv(
+    args: argparse.Namespace,
+    launch_dir: Path,
+    scrub: list[str],
+    default_model: str | None,
+) -> list[str]:
+    # Per project: one project's spend history is not another's business, and a
+    # shared ledger mount is a cross-project channel for free.
+    usage_dir = state_home() / "usage" / args.project
     usage_dir.mkdir(parents=True, exist_ok=True)
-    return [
-        "docker", "run", "--rm", "-i",
+    argv = [
+        args.engine, "run", "--rm", "-i",
         *(["-t"] if sys.stdin.isatty() else []),
+        # A packaging boundary, not a root playground: workspace files it writes
+        # belong to the user.
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--cap-drop=ALL",
         "--add-host", f"{CONTAINER_HOST}:host-gateway",
         "--env-file", str(launch_dir / "env"),
         "-e", f"MA_SCRUB={','.join(scrub)}",
         "-e", f"MA_PROJECT={args.project}",
-        "-v", f"{launch_dir}:/run/ma:ro",
+        # litellm caches under $HOME, and the image's /root is closed to our uid.
+        "-e", "HOME=/tmp",
+    ]
+    if default_model:
+        argv += ["-e", f"MA_DEFAULT_MODEL={default_model}"]
+    for name in PROXY_VARS:
+        value = os.environ.get(name)
+        if value:
+            argv += ["-e", f"{name}={value}"]
+    if args.ca_bundle:
+        argv += ["-v", f"{Path(args.ca_bundle).resolve()}:{CA_IN_CONTAINER}:ro"]
+        argv += [a for name in CA_VARS for a in ("-e", f"{name}={CA_IN_CONTAINER}")]
+    argv += [
+        # ONLY the config. The launch directory also holds the env file, and
+        # mounting it would let the agent read every secret in the project.
+        "-v", f"{launch_dir / 'config.yaml'}:{CONFIG_IN_CONTAINER}:ro",
         "-v", f"{Path.cwd()}:/workspace",
         "-v", f"{usage_dir}:/var/ma-usage",
         "-w", "/workspace",
         args.image,
         *args.agent,
     ]
+    return argv
+
+
+def _report(state: Pipeline, args: argparse.Namespace) -> list[Backend]:
+    """Say what the launch is dropping and what drifted; return what remains."""
+    usable = []
+    for backend in state.backends:
+        status = state.cred_status[backend.name]
+        if status == "missing":
+            # The <dir>/<name>.env convention lives in credentials.py; borrow it
+            # rather than restate it here.
+            print(
+                f"WARNING: backend {backend.name!r} needs credential "
+                f"{backend.credential!r}, which this machine does not have; "
+                f"dropping it from this launch. Create "
+                f"{credentials.path(backend.credential, args.cred_dir)} to use it.",
+                file=sys.stderr,
+            )
+            continue
+        # Expired is not missing: the key may still answer, and a launch cut
+        # short mid-session is worse than one that starts with a warning.
+        if status == "stale":
+            print(
+                f"WARNING: credential {backend.credential!r} for backend "
+                f"{backend.name!r} has expired; run `ma keys {backend.credential}` "
+                f"to refresh it. Starting anyway.",
+                file=sys.stderr,
+            )
+        # A down backend is not fatal — the rest of the project still works —
+        # but the session is missing models, so say which and why.
+        result = state.probes[backend.name]
+        if result.status == "down":
+            print(
+                f"warning: backend {backend.name!r} is down, serving nothing "
+                f"this session: {result.error}",
+                file=sys.stderr,
+            )
+        usable.append(backend)
+
+    for note in state.stale:
+        print(f"warning: {note}", file=sys.stderr)
+    for name, lines in state.changes.items():
+        for line in lines:
+            print(f"change {name}: {line}", file=sys.stderr)
+    return usable
 
 
 def launch(args: argparse.Namespace) -> int:
@@ -152,68 +271,42 @@ def launch(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    # A launch that quietly drops a backend spends the wrong money later; say so
-    # now and stop.
-    missing = [b for b in state.backends if state.cred_status[b.name] == "missing"]
-    if missing:
-        for backend in missing:
-            # The <dir>/<name>.env convention lives in credentials.py; borrow it
-            # rather than restate it here.
-            path = credentials._path(backend.credential, args.cred_dir)
-            print(
-                f"backend {backend.name!r} needs credential "
-                f"{backend.credential!r}: create {path}",
-                file=sys.stderr,
-            )
+    usable = _report(state, args)
+    merged = [m for b in usable for m in state.merged.get(b.name, [])]
+    if not merged:
+        print(
+            f"project {args.project!r} selects no models: every backend it names is "
+            f"missing a credential, down, or filtered out. Nothing to launch.",
+            file=sys.stderr,
+        )
         return 2
 
-    # Expired is not missing: the key may still answer, and a launch cut short
-    # mid-session is worse than one that starts with a warning it can act on.
-    for backend in state.backends:
-        if state.cred_status[backend.name] == "stale":
-            print(
-                f"WARNING: credential {backend.credential!r} for backend "
-                f"{backend.name!r} has expired; run `ma keys {backend.credential}` "
-                f"to refresh it. Starting anyway.",
-                file=sys.stderr,
-            )
-
-    # A down backend is not fatal — the rest of the project still works — but the
-    # session is missing models, so say which and why.
-    for backend in state.backends:
-        result = state.probes[backend.name]
-        if result.status == "down":
-            print(
-                f"warning: backend {backend.name!r} is down, serving nothing "
-                f"this session: {result.error}",
-                file=sys.stderr,
-            )
-
     env_vars: dict[str, str] = {}
-    key_env: dict[str, str] = {}
-    for backend in state.backends:
-        if not backend.credential:
-            continue
-        values = credentials.resolve(backend.credential, args.cred_dir) or {}
-        env_vars.update(values)
-        var = key_var(values)
-        if var:
-            key_env[backend.name] = var
-
-    backends = {b.name: for_container(b) for b in state.backends}
-    merged = [m for b in state.backends for m in state.merged.get(b.name, [])]
+    key_env: dict[str, dict[str, str]] = {}
+    backends = {b.name: for_container(b) for b in usable}
     try:
+        for backend in usable:
+            if not backend.credential:
+                continue
+            values = credentials.resolve(backend.credential, args.cred_dir) or {}
+            names = {var: namespaced(backend.name, var) for var in values}
+            env_vars.update({names[var]: value for var, value in values.items()})
+            key_env[backend.name] = names
         config_yaml = to_yaml(render_config(backends, merged, key_env))
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
 
-    launch_dir = _write_launch_dir(config_yaml, env_vars)
+    project = state.config.projects.get(args.project)
+    launch_dir = _write_launch_dir(config_yaml, env_vars, secrets_ok=not args.dry_run)
     try:
-        argv = _docker_argv(args, launch_dir, sorted(env_vars))
+        argv = _docker_argv(
+            args, launch_dir, sorted(env_vars), project and project.default_model
+        )
         if args.dry_run:
             print(config_yaml)
             print(shlex.join(argv))
+            print("(dry run: no env file was written, so this command cannot run as-is)")
             return 0
         return subprocess.run(argv).returncode
     finally:

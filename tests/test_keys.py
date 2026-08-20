@@ -26,7 +26,7 @@ class _Completed:
         self.stderr = stderr
 
 
-def stub_aws(monkeypatch, *, result=None, raises=None, calls=None):
+def stub_aws(monkeypatch, *, result=None, raises=None, calls=None, kwargs_seen=None):
     """Stand in for the `aws` binary, recording the argv it was invoked with."""
     import json
 
@@ -35,6 +35,8 @@ def stub_aws(monkeypatch, *, result=None, raises=None, calls=None):
     def fake_run(argv, *args, **kwargs):
         if calls is not None:
             calls.append(list(argv))
+        if kwargs_seen is not None:
+            kwargs_seen.update(kwargs)
         if raises is not None:
             raise raises
         return completed
@@ -55,15 +57,24 @@ def test_fetch_asks_the_cli_for_the_named_profile(monkeypatch):
     ]
 
 
-def test_fetch_failure_carries_the_stderr(monkeypatch):
-    stub_aws(
-        monkeypatch,
-        result=_Completed(255, stderr="The config profile (aws-gov) could not be found\n"),
-    )
+def test_fetch_captures_stdout_but_leaves_stderr_to_the_terminal(monkeypatch):
+    # The secret is on stdout; stderr carries the MFA and SSO prompts, which are
+    # useless unless the user sees them while the CLI is waiting.
+    import subprocess
+
+    seen = {}
+    stub_aws(monkeypatch, kwargs_seen=seen)
+    keys.fetch("aws-gov")
+    assert seen["stdout"] == subprocess.PIPE
+    assert "stderr" not in seen and not seen.get("capture_output")
+
+
+def test_fetch_failure_names_the_profile_and_suggests_a_login(monkeypatch):
+    stub_aws(monkeypatch, result=_Completed(255))
     with pytest.raises(ConfigError) as exc:
         keys.fetch("aws-gov")
-    assert "could not be found" in str(exc.value)
     assert "aws-gov" in str(exc.value)
+    assert "aws sso login --profile aws-gov" in str(exc.value)
 
 
 def test_fetch_without_the_aws_binary_explains_itself(monkeypatch):
@@ -117,6 +128,17 @@ def test_write_creates_the_directory_and_tightens_a_loose_file(tmp_path):
     path.chmod(0o644)  # e.g. a file some other tool left behind
     keys.write_credential("aws-gov", SHORT_TERM, cred_dir)
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_keeps_the_credential_directory_private(tmp_path):
+    # Which credentials this machine holds is itself worth hiding.
+    cred_dir = tmp_path / "creds"
+    keys.write_credential("aws-gov", LONG_TERM, cred_dir)
+    assert cred_dir.stat().st_mode & 0o777 == 0o700
+
+    cred_dir.chmod(0o755)  # e.g. created by an older version, or by hand
+    keys.write_credential("aws-gov", LONG_TERM, cred_dir)
+    assert cred_dir.stat().st_mode & 0o777 == 0o700
 
 
 def test_refresh_replaces_rather_than_appends(tmp_path):
@@ -174,10 +196,12 @@ def test_cli_keys_says_long_term_when_there_is_no_expiry(monkeypatch, tmp_path, 
 
 
 def test_cli_keys_failure_exits_two_with_stderr(monkeypatch, tmp_path, capsys):
-    stub_aws(monkeypatch, result=_Completed(1, stderr="Error loading SSO Token: expired\n"))
+    # The CLI's own diagnosis went straight to the terminal; ours says what to
+    # do about it and writes nothing.
+    stub_aws(monkeypatch, result=_Completed(1))
     code = cli.main(["keys", "aws-gov", "--cred-dir", str(tmp_path)])
     captured = capsys.readouterr()
     assert code == 2
-    assert "expired" in captured.err
+    assert "aws sso login --profile aws-gov" in captured.err
     assert captured.out == ""
     assert not (tmp_path / "aws-gov.env").exists()

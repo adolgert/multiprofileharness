@@ -26,6 +26,16 @@ def test_save_stamps_and_load_strips(tmp_path):
     assert snapshot.load(path) == state
 
 
+def test_save_replaces_the_file_whole_and_leaves_no_debris(tmp_path):
+    # Concurrent launches: a reader either sees the old diary or the new one,
+    # never a half-written one, and no temp file survives the write.
+    path = tmp_path / "s.json"
+    snapshot.save(path, {"lab": {"status": "live", "models": ["llama"]}})
+    snapshot.save(path, {"lab": {"status": "down", "models": []}})
+    assert snapshot.load(path) == {"lab": {"status": "down", "models": []}}
+    assert [p.name for p in tmp_path.iterdir()] == ["s.json"]
+
+
 def test_save_does_not_mutate_caller_state(tmp_path):
     state = {"lab": {"status": "live", "models": []}}
     snapshot.save(tmp_path / "s.json", state)

@@ -3,17 +3,19 @@ from pathlib import Path
 
 import pytest
 
-from multiagent.probe import probe_backend
+from multiagent.probe import ensure_v1, probe_backend
 from multiagent.types import Backend
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def stub_fetch(responses):
+def stub_fetch(responses, seen=None):
     """responses maps url -> response dict, or -> callable(payload) when one url
     serves several models (ollama's /api/show)."""
 
-    def fetch(url, payload=None, timeout=3.0):
+    def fetch(url, payload=None, headers=None):
+        if seen is not None:
+            seen.append((url, headers))
         if url not in responses:
             raise RuntimeError(f"unexpected url {url}")
         value = responses[url]
@@ -22,7 +24,7 @@ def stub_fetch(responses):
     return fetch
 
 
-def no_fetch(url, payload=None, timeout=3.0):
+def no_fetch(url, payload=None, headers=None):
     raise AssertionError(f"probe made a network call to {url}")
 
 
@@ -55,6 +57,17 @@ OLLAMA_SHOW = {
         "capabilities": ["embedding"],
     },
 }
+
+
+def test_an_unpatched_probe_cannot_reach_the_network():
+    # conftest replaces probe._http_json; probe_backend must look it up at call
+    # time, or a test that patches the wrong name silently probes a real ollama.
+    backend = Backend(
+        name="local", type="ollama", api_base="http://localhost:11434", discovery="dynamic"
+    )
+    result = probe_backend(backend)
+    assert result.status == "down"
+    assert "test reached the network" in result.error
 
 
 def test_static_backend_makes_no_network_call():
@@ -183,3 +196,73 @@ def test_listing_failure_is_down_with_error(backend):
     assert result.status == "down"
     assert result.models == []
     assert result.error and "unexpected url" in result.error
+
+
+# --- the /v1 root ---------------------------------------------------------
+
+
+def test_ensure_v1_appends_once_and_only_once():
+    for given in ("http://h:8000", "http://h:8000/", "http://h:8000/v1", "http://h:8000/v1/"):
+        assert ensure_v1(given) == "http://h:8000/v1"
+
+
+def test_openai_compat_api_base_already_ending_in_v1_is_not_doubled():
+    listing = {"data": [{"id": "m"}]}
+    fetch = stub_fetch({"http://gpu01:8000/v1/models": listing})
+    for given in ("http://gpu01:8000/v1", "http://gpu01:8000/v1/", "http://gpu01:8000"):
+        backend = Backend(
+            name="vllm", type="openai-compat", api_base=given, discovery="dynamic"
+        )
+        assert [m.id for m in probe_backend(backend, fetch=fetch).models] == ["m"]
+
+
+# --- authentication -------------------------------------------------------
+
+
+def test_api_key_is_sent_as_a_bearer_token():
+    seen = []
+    fetch = stub_fetch({"http://gpu01:8000/v1/models": {"data": [{"id": "m"}]}}, seen)
+    backend = Backend(
+        name="vllm", type="openai-compat", api_base="http://gpu01:8000", discovery="dynamic"
+    )
+    result = probe_backend(backend, fetch=fetch, api_key="tok-123")
+    assert result.status == "live"
+    assert seen == [("http://gpu01:8000/v1/models", {"Authorization": "Bearer tok-123"})]
+
+
+def test_ollama_sends_the_token_on_the_detail_call_too():
+    seen = []
+    fetch = stub_fetch(
+        {
+            "http://localhost:11434/api/tags": {"models": [{"name": "qwen2.5:14b"}]},
+            "http://localhost:11434/api/show": lambda payload: OLLAMA_SHOW[payload["model"]],
+        },
+        seen,
+    )
+    backend = Backend(
+        name="local", type="ollama", api_base="http://localhost:11434", discovery="dynamic"
+    )
+    probe_backend(backend, fetch=fetch, api_key="tok-123")
+    assert [headers for _, headers in seen] == [{"Authorization": "Bearer tok-123"}] * 2
+
+
+def test_no_api_key_means_no_authorization_header():
+    seen = []
+    fetch = stub_fetch({"http://gpu01:8000/v1/models": {"data": [{"id": "m"}]}}, seen)
+    backend = Backend(
+        name="vllm", type="openai-compat", api_base="http://gpu01:8000", discovery="dynamic"
+    )
+    probe_backend(backend, fetch=fetch)
+    assert seen == [("http://gpu01:8000/v1/models", None)]
+
+
+def test_a_failed_authenticated_probe_never_quotes_the_key():
+    def fetch(url, payload=None, headers=None):
+        raise RuntimeError(f"HTTP Error 401: Unauthorized for {url}")
+
+    backend = Backend(
+        name="vllm", type="openai-compat", api_base="http://gpu01:8000", discovery="dynamic"
+    )
+    result = probe_backend(backend, fetch=fetch, api_key="tok-123")
+    assert result.status == "down"
+    assert "401" in result.error and "tok-123" not in result.error

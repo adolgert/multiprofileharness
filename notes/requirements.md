@@ -75,10 +75,11 @@ work use case — a notion of *what changed since yesterday*.
 
 ## Open questions (work environment)
 
-- Is Docker available and permitted on work machines? The current architecture
-  runs a LiteLLM proxy in or beside the agent container; if Docker is out, the
-  proxy must run as a plain process, or the tool must be able to skip the proxy
-  and export env vars directly.
+- Is a container engine available and permitted on work machines — docker,
+  rootless podman, neither? The current architecture runs a LiteLLM proxy in
+  or beside the agent container and supports either engine; if both are out,
+  the proxy must run as a plain process, or the tool must be able to skip the
+  proxy and export env vars directly.
 - Can Python packages be installed at work (internal mirror? vendored wheels?),
   or should the tool restrict itself to the standard library?
 - Does "monitor" mean on-demand ("what changed since I last ran `ma models`?")

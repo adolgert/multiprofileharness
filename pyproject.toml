@@ -2,7 +2,7 @@
 name = "multiagent"
 version = "0.1.0"
 description = "Start AI agents against the right backends with the right money"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = ["pyyaml>=6"]
 
 [project.scripts]

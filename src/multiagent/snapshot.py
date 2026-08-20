@@ -7,6 +7,8 @@ selection; it exists only to report drift back to the user.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,7 +40,18 @@ def save(path: Path, state: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     stamped = dict(state)
     stamped[_STAMP] = datetime.now(timezone.utc).isoformat()
-    path.write_text(json.dumps(stamped, indent=2, sort_keys=True) + "\n")
+    text = json.dumps(stamped, indent=2, sort_keys=True) + "\n"
+    # Two `ma run`s can start at once. A half-written diary parses as nothing,
+    # and nothing reads as "first observation" for every backend, so the file
+    # is replaced whole: same directory, so os.replace stays atomic.
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "w") as out:
+            out.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def diff(prev: dict, current: dict) -> dict[str, list[str]]:

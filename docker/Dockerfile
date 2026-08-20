@@ -14,4 +14,10 @@ RUN chmod +x /app/entrypoint.sh
 # agent happens to run in.
 ENV PYTHONPATH=/app
 
+# Without this litellm fetches its price map from GitHub at import: five seconds
+# of startup, an unexplained outbound connection from a box holding cloud keys,
+# and a hard failure where there is no route out. The vendored catalog is the
+# price source anyway.
+ENV LITELLM_LOCAL_MODEL_COST_MAP=True
+
 ENTRYPOINT ["/app/entrypoint.sh"]
