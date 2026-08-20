@@ -1,0 +1,37 @@
+# What endpoints exist and how to reach them. Connectivity only — model facts
+# live in models.yaml; secrets live in ~/.config/multiagent/credentials/<name>.env
+# and are referenced here by NAME.
+backends:
+  home-ollama:
+    type: ollama
+    api_base: http://localhost:11434
+    discovery: dynamic
+
+  home-ollama-openai:
+    # The same server through its OpenAI-compatible facade. Exists to exercise
+    # the vLLM-shaped adapter (work vLLM instances probe identically); only the
+    # adapter-test project selects it.
+    type: openai-compat
+    api_base: http://localhost:11434
+    discovery: dynamic
+
+  gemini:
+    type: gemini
+    credential: gemini-api-key
+    models: [gemini-2.5-pro, gemini-2.5-flash]
+
+  bedrock-personal:
+    # Personal AWS account (commercial partition). The us. prefix is a
+    # cross-region inference profile; region is where the request enters.
+    type: bedrock
+    region: us-west-2
+    credential: bedrock-personal
+    models:
+      - us.anthropic.claude-haiku-4-5-20251001-v1:0
+      - us.anthropic.claude-sonnet-4-6
+      - us.amazon.nova-lite-v1:0
+
+  anthropic:
+    type: anthropic
+    credential: anthropic-api-key
+    models: [claude-opus-5, claude-sonnet-5]

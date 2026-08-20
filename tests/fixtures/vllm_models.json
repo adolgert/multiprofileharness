@@ -1,0 +1,55 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen2.5-14B-Instruct",
+      "object": "model",
+      "created": 1755640000,
+      "owned_by": "vllm",
+      "root": "Qwen/Qwen2.5-14B-Instruct",
+      "parent": null,
+      "max_model_len": 16384,
+      "permission": [
+        {
+          "id": "modelperm-4c1e2a0d9b7f4a2f8f1d0c3b5e6a7d81",
+          "object": "model_permission",
+          "created": 1755640000,
+          "allow_create_engine": false,
+          "allow_sampling": true,
+          "allow_logprobs": true,
+          "allow_search_indices": false,
+          "allow_view": true,
+          "allow_fine_tuning": false,
+          "organization": "*",
+          "group": null,
+          "is_blocking": false
+        }
+      ]
+    },
+    {
+      "id": "meta-llama/Llama-3.1-8B-Instruct",
+      "object": "model",
+      "created": 1755640000,
+      "owned_by": "vllm",
+      "root": "meta-llama/Llama-3.1-8B-Instruct",
+      "parent": null,
+      "max_model_len": 131072,
+      "permission": [
+        {
+          "id": "modelperm-9a3f7c21d5e84b06a2c7f1b8e4d0937a",
+          "object": "model_permission",
+          "created": 1755640000,
+          "allow_create_engine": false,
+          "allow_sampling": true,
+          "allow_logprobs": true,
+          "allow_search_indices": false,
+          "allow_view": true,
+          "allow_fine_tuning": false,
+          "organization": "*",
+          "group": null,
+          "is_blocking": false
+        }
+      ]
+    }
+  ]
+}

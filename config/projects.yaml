@@ -1,0 +1,16 @@
+# A project is an authorization policy: it names the backends — and therefore
+# the credentials, and therefore the money — a session may use. Anything
+# unlisted is unreachable from that project, not merely discouraged.
+projects:
+  gemini-work:
+    backends: [home-ollama, gemini]
+
+  bedrock-work:
+    backends: [home-ollama, bedrock-personal]
+
+  paper-review:
+    backends: [home-ollama]      # nothing leaves the house
+    default_model: qwen2.5-14b
+
+  adapter-test:
+    backends: [home-ollama-openai]

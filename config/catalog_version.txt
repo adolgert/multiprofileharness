@@ -1,0 +1,2 @@
+source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+fetched: 2026-08-20

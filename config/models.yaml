@@ -1,0 +1,85 @@
+# What we believe about models — the facts no endpoint will tell us.
+# Merge precedence: observed (probe) > deployments entry > models entry > catalog.
+# Disagreements between belief and observation are reported, not silently
+# resolved; record where a fact came from as a dated comment.
+# Local models carry a nominal $1/Mtok both ways, so logged cost reads
+# directly as millions of tokens.
+models:
+  qwen2.5-14b:
+    match: ["qwen2.5:14b", "Qwen/Qwen2.5-14B*"]
+    context: 131072       # native; ollama serves it at 32768, so expect a reported conflict
+    tools: true
+    tokenizer: qwen2
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  qwen2.5-7b:
+    match: ["qwen2.5:7b", "Qwen/Qwen2.5-7B*"]
+    tools: true
+    tokenizer: qwen2
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  codestral-22b:
+    match: ["codestral:*"]
+    context: 32768
+    tools: false          # code/FIM model; no tool template on ollama
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  llava:
+    match: ["llava:*"]
+    vision: true
+    tools: false
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  deepseek-r1-14b:
+    match: ["deepseek-r1:14b"]
+    tools: false          # r1 distill chat template has no tool support
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  deepseek-r1-32b:
+    match: ["deepseek-r1:32b"]
+    tools: false
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  deepseek-r1-70b:
+    match: ["deepseek-r1:70b"]
+    tools: false
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  llama3.3-70b:
+    match: ["llama3.3*"]
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  llama3.2:
+    match: ["llama3.2*"]
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  mxbai-embed-large:
+    match: ["mxbai-embed-large*"]
+    mode: embedding
+    input_per_mtok: 1.0
+    output_per_mtok: 1.0
+  gemini-2.5-pro:
+    match: ["gemini-2.5-pro*"]
+    catalog_key: gemini/gemini-2.5-pro
+  gemini-2.5-flash:
+    match: ["gemini-2.5-flash*"]
+    catalog_key: gemini/gemini-2.5-flash
+  nova-lite:
+    match: ["*amazon.nova-lite*"]
+  claude-haiku-4-5:
+    # No catalog_key: the served id IS the catalog key, and the us.… entry
+    # carries the Bedrock cross-region price, not the first-party API price.
+    match: ["*anthropic.claude-haiku-4-5*", "claude-haiku-4-5*"]
+  claude-sonnet-4-6:
+    match: ["*anthropic.claude-sonnet-4-6*", "claude-sonnet-4-6*"]
+  claude-opus-5:
+    match: ["claude-opus-5*", "*anthropic.claude-opus-5*"]
+    catalog_key: claude-opus-5
+  claude-sonnet-5:
+    match: ["claude-sonnet-5*", "*anthropic.claude-sonnet-5*"]
+    catalog_key: claude-sonnet-5
+
+deployments:
+  home-ollama:
+    "qwen2.5:14b":
+      max_output: 4096    # example deployment override: we cap generation on this box
